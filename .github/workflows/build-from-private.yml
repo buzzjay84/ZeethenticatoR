@@ -1,0 +1,78 @@
+name: Build release from private source
+
+# Lives in the PUBLIC release repo (buzzjay84/ZeethenticatoR) as
+# .github/workflows/build-from-private.yml; a copy is kept in the private source
+# at .github/release-repo/. Every 10 minutes it compares the private repo's main
+# commit with the one the "latest" release was built from, and rebuilds only when
+# it changed. The private source is checked out read-only with a deploy key.
+# Public logs: nothing here echoes source. Force a rebuild:
+#   gh workflow run build-from-private.yml -R buzzjay84/ZeethenticatoR -f force=true
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the source has not changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v5
+        with:
+          repository: jaybhee84/ZeethenticatoR
+          ref: main
+          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Skip if already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          BUILT=$(gh release view latest -R "${{ github.repository }}" --json body --jq .body 2>/dev/null | grep -o '[0-9a-f]\{40\}' || true)
+          if [ "$SHA" = "$BUILT" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Already released $SHA"; echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v5
+        if: steps.check.outputs.skip != 'true'
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Build signed APK
+        if: steps.check.outputs.skip != 'true'
+        working-directory: android
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_FILE: ${{ runner.temp }}/release.jks
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$KEYSTORE_FILE"
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+          mv app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/ZeethenticatoR.apk"
+
+      - name: Publish to the "latest" release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest -R "${{ github.repository }}" --yes --cleanup-tag || true
+          gh release create latest "$RUNNER_TEMP/ZeethenticatoR.apk" -R "${{ github.repository }}" --target main \
+            --title "ZeethenticatoR (build ${{ github.run_number }})" \
+            --notes "Download ZeethenticatoR.apk on your phone and open it to install or update. Source ${{ steps.check.outputs.sha }}"
